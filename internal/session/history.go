@@ -377,7 +377,7 @@ func copyMessages(msgs []llm.Message) []llm.Message {
 			Role:       m.Role,
 			Content:    m.Content,
 			ToolCallID: m.ToolCallID,
-			ToolCalls:  append([]llm.ToolCall(nil), m.ToolCalls...),
+			ToolCalls:  llm.CopyToolCalls(m.ToolCalls),
 		}
 	}
 	return cp

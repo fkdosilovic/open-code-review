@@ -271,3 +271,53 @@ func TestBuildToolInputSchema_Empty(t *testing.T) {
 		t.Errorf("empty input produced non-empty schema: %+v", schema)
 	}
 }
+
+// TestBuildOpenAIParams_ToolCallMessage verifies that assistant messages with tool calls
+// are mapped to OpenAI parameters.
+func TestBuildOpenAIParams_ToolCallMessage(t *testing.T) {
+	c := &OpenAIClient{}
+	req := ChatRequest{
+		Messages: []Message{
+			{
+				Role: "assistant",
+				ToolCalls: []ToolCall{
+					{
+						ID:   "call_1",
+						Type: "function",
+						Function: FunctionCall{
+							Name:        "file_read_diff",
+							Arguments:   `{"path":"main.go"}`,
+							ExtraFields: map[string]any{"fn_extra": "val1"},
+						},
+						ExtraFields: map[string]any{"thought_signature": "sig_xyz123"},
+					},
+				},
+			},
+		},
+	}
+
+	params := c.buildOpenAIParams("gemini-3.7-flash", req)
+	if len(params.Messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(params.Messages))
+	}
+	asst := params.Messages[0].OfAssistant
+	if asst == nil {
+		t.Fatal("expected assistant message param")
+	}
+	if len(asst.ToolCalls) != 1 {
+		t.Fatalf("tool_calls = %d, want 1", len(asst.ToolCalls))
+	}
+	tc := asst.ToolCalls[0].OfFunction
+	if tc == nil {
+		t.Fatal("expected function tool call")
+	}
+	if tc.ID != "call_1" {
+		t.Errorf("tc.ID = %q, want call_1", tc.ID)
+	}
+	if tc.Function.Name != "file_read_diff" {
+		t.Errorf("tc.Function.Name = %q, want file_read_diff", tc.Function.Name)
+	}
+	if tc.Function.Arguments != `{"path":"main.go"}` {
+		t.Errorf("tc.Function.Arguments = %q, want {\"path\":\"main.go\"}", tc.Function.Arguments)
+	}
+}

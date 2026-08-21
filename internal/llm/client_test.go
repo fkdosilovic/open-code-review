@@ -963,6 +963,288 @@ func TestOpenAIClient_StreamingToolCall(t *testing.T) {
 	}
 }
 
+func TestOpenAIClient_NonStreamingToolCall_ThoughtSignature(t *testing.T) {
+	responseJSON := `{
+		"id": "chatcmpl-gemini-test",
+		"object": "chat.completion",
+		"created": 1234567890,
+		"model": "gemini-3.7-flash",
+		"choices": [
+			{
+				"index": 0,
+				"message": {
+					"role": "assistant",
+					"content": null,
+					"tool_calls": [
+						{
+							"id": "call_diff_1",
+							"type": "function",
+							"function": {
+								"name": "file_read_diff",
+								"arguments": "{\"path\":\"foo.go\"}",
+								"fn_meta": "extra_data"
+							},
+							"thought_signature": "cryptographic_signature_abc123"
+						}
+					]
+				},
+				"finish_reason": "tool_calls"
+			}
+		],
+		"usage": {
+			"prompt_tokens": 10,
+			"completion_tokens": 20,
+			"total_tokens": 30
+		}
+	}`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(responseJSON))
+	}))
+	defer server.Close()
+
+	client := NewOpenAIClient(ClientConfig{
+		Provider: "gemini",
+		URL:      server.URL + "/v1",
+		APIKey:   "test-key",
+		Model:    "gemini-3.7-flash",
+	})
+
+	resp, err := client.CompletionsWithCtx(context.Background(), ChatRequest{
+		Model:    "gemini-3.7-flash",
+		Messages: []Message{{Role: "user", Content: "review diff"}},
+	})
+	if err != nil {
+		t.Fatalf("CompletionsWithCtx error: %v", err)
+	}
+
+	toolCalls := resp.ToolCalls()
+	if len(toolCalls) != 1 {
+		t.Fatalf("toolCalls len = %d, want 1", len(toolCalls))
+	}
+	tc := toolCalls[0]
+	if tc.ID != "call_diff_1" {
+		t.Errorf("tc.ID = %q, want call_diff_1", tc.ID)
+	}
+	if tc.Function.Name != "file_read_diff" {
+		t.Errorf("tc.Function.Name = %q, want file_read_diff", tc.Function.Name)
+	}
+	if tc.ExtraFields == nil || tc.ExtraFields["thought_signature"] != "cryptographic_signature_abc123" {
+		t.Errorf("tc.ExtraFields = %v, want thought_signature=cryptographic_signature_abc123", tc.ExtraFields)
+	}
+	if tc.Function.ExtraFields == nil || tc.Function.ExtraFields["fn_meta"] != "extra_data" {
+		t.Errorf("tc.Function.ExtraFields = %v, want fn_meta=extra_data", tc.Function.ExtraFields)
+	}
+}
+
+func TestOpenAIClient_StreamingToolCall_ThoughtSignature(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		chunk1Map := map[string]any{
+			"id":      "chatcmpl-gemini-stream",
+			"object":  "chat.completion.chunk",
+			"created": 1,
+			"model":   "gemini-3.7-flash",
+			"choices": []map[string]any{
+				{
+					"index": 0,
+					"delta": map[string]any{
+						"role": "assistant",
+						"tool_calls": []map[string]any{
+							{
+								"index": 0,
+								"id":    "call_diff_2",
+								"type":  "function",
+								"function": map[string]any{
+									"name":      "file_read_diff",
+									"arguments": `{"path":`,
+								},
+								"thought_signature": "stream_sig_xyz",
+							},
+						},
+					},
+					"finish_reason": nil,
+				},
+			},
+		}
+		chunk2Map := map[string]any{
+			"id":      "chatcmpl-gemini-stream",
+			"object":  "chat.completion.chunk",
+			"created": 1,
+			"model":   "gemini-3.7-flash",
+			"choices": []map[string]any{
+				{
+					"index": 0,
+					"delta": map[string]any{
+						"tool_calls": []map[string]any{
+							{
+								"index": 0,
+								"function": map[string]any{
+									"arguments":      `"bar.go"}`,
+									"fn_stream_meta": "meta_val",
+								},
+							},
+						},
+					},
+					"finish_reason": nil,
+				},
+			},
+		}
+		chunk3Map := map[string]any{
+			"id":      "chatcmpl-gemini-stream",
+			"object":  "chat.completion.chunk",
+			"created": 1,
+			"model":   "gemini-3.7-flash",
+			"choices": []map[string]any{
+				{
+					"index":         0,
+					"delta":         map[string]any{},
+					"finish_reason": "tool_calls",
+				},
+			},
+		}
+		c1, _ := json.Marshal(chunk1Map)
+		c2, _ := json.Marshal(chunk2Map)
+		c3, _ := json.Marshal(chunk3Map)
+		writeOpenAISSE(t, w, string(c1), string(c2), string(c3))
+	}))
+	defer server.Close()
+
+	client := NewOpenAIClient(ClientConfig{
+		Provider:  "gemini",
+		URL:       server.URL + "/v1",
+		APIKey:    "test-key",
+		Model:     "gemini-3.7-flash",
+		ExtraBody: map[string]any{"stream": true},
+	})
+
+	resp, err := client.CompletionsWithCtx(context.Background(), ChatRequest{
+		Model:    "gemini-3.7-flash",
+		Messages: []Message{{Role: "user", Content: "read diff"}},
+	})
+	if err != nil {
+		t.Fatalf("CompletionsWithCtx error: %v", err)
+	}
+
+	toolCalls := resp.ToolCalls()
+	if len(toolCalls) != 1 {
+		t.Fatalf("toolCalls len = %d, want 1", len(toolCalls))
+	}
+	tc := toolCalls[0]
+	if tc.ID != "call_diff_2" {
+		t.Errorf("tc.ID = %q, want call_diff_2", tc.ID)
+	}
+	if tc.Function.Name != "file_read_diff" {
+		t.Errorf("tc.Function.Name = %q, want file_read_diff", tc.Function.Name)
+	}
+	if tc.Function.Arguments != `{"path":"bar.go"}` {
+		t.Errorf("tc.Function.Arguments = %q, want {\"path\":\"bar.go\"}", tc.Function.Arguments)
+	}
+	if tc.ExtraFields == nil || tc.ExtraFields["thought_signature"] != "stream_sig_xyz" {
+		t.Errorf("tc.ExtraFields = %v, want thought_signature=stream_sig_xyz", tc.ExtraFields)
+	}
+	if tc.Function.ExtraFields == nil || tc.Function.ExtraFields["fn_stream_meta"] != "meta_val" {
+		t.Errorf("tc.Function.ExtraFields = %v, want fn_stream_meta=meta_val", tc.Function.ExtraFields)
+	}
+}
+
+func TestOpenAIClient_FollowUpToolCall_ThoughtSignatureSent(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("failed to read request body: %v", err)
+		}
+		if err := json.Unmarshal(bodyBytes, &receivedBody); err != nil {
+			t.Errorf("failed to unmarshal request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id": "chatcmpl-gemini-turn2",
+			"object": "chat.completion",
+			"created": 1,
+			"model": "gemini-3.7-flash",
+			"choices": [
+				{
+					"index": 0,
+					"message": {
+						"role": "assistant",
+						"content": "review complete"
+					},
+					"finish_reason": "stop"
+				}
+			]
+		}`))
+	}))
+	defer server.Close()
+
+	client := NewOpenAIClient(ClientConfig{
+		Provider: "gemini",
+		URL:      server.URL + "/v1",
+		APIKey:   "test-key",
+		Model:    "gemini-3.7-flash",
+	})
+
+	messages := []Message{
+		{Role: "user", Content: "review diff"},
+		{
+			Role: "assistant",
+			ToolCalls: []ToolCall{
+				{
+					ID:   "call_diff_3",
+					Type: "function",
+					Function: FunctionCall{
+						Name:        "file_read_diff",
+						Arguments:   `{"path":"main.go"}`,
+						ExtraFields: map[string]any{"fn_meta": "extra_data"},
+					},
+					ExtraFields: map[string]any{"thought_signature": "sig_turn1_xyz"},
+				},
+			},
+		},
+		{Role: "tool", ToolCallID: "call_diff_3", Content: "diff content here"},
+	}
+
+	resp, err := client.CompletionsWithCtx(context.Background(), ChatRequest{
+		Model:    "gemini-3.7-flash",
+		Messages: messages,
+	})
+	if err != nil {
+		t.Fatalf("CompletionsWithCtx failed: %v", err)
+	}
+	if got := resp.Content(); got != "review complete" {
+		t.Errorf("Content() = %q, want 'review complete'", got)
+	}
+
+	// Verify the wire request payload sent to the server retained the thought_signature and fn_meta
+	msgsRaw, ok := receivedBody["messages"].([]any)
+	if !ok || len(msgsRaw) != 3 {
+		t.Fatalf("receivedBody messages = %v, want 3 messages", receivedBody["messages"])
+	}
+	asstMsg, ok := msgsRaw[1].(map[string]any)
+	if !ok {
+		t.Fatalf("msgsRaw[1] = %v, want map", msgsRaw[1])
+	}
+	toolCallsRaw, ok := asstMsg["tool_calls"].([]any)
+	if !ok || len(toolCallsRaw) != 1 {
+		t.Fatalf("asstMsg tool_calls = %v, want 1 call", asstMsg["tool_calls"])
+	}
+	tcMap, ok := toolCallsRaw[0].(map[string]any)
+	if !ok {
+		t.Fatalf("toolCallsRaw[0] = %v, want map", toolCallsRaw[0])
+	}
+	if tcMap["thought_signature"] != "sig_turn1_xyz" {
+		t.Errorf("tcMap[thought_signature] = %v, want sig_turn1_xyz", tcMap["thought_signature"])
+	}
+	fnMap, ok := tcMap["function"].(map[string]any)
+	if !ok {
+		t.Fatalf("tcMap[function] = %v, want map", tcMap["function"])
+	}
+	if fnMap["fn_meta"] != "extra_data" {
+		t.Errorf("fnMap[fn_meta] = %v, want extra_data", fnMap["fn_meta"])
+	}
+}
+
 func TestOpenAIClient_StreamingError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeOpenAISSE(t, w, `{"error":{"message":"upstream stream failed","type":"server_error"}}`)

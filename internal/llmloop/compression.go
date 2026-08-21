@@ -198,10 +198,17 @@ func buildMessageXML(msgs []llm.Message) string {
 	return sb.String()
 }
 
-// copyMessages creates a shallow copy of a message slice.
+// copyMessages creates a copy of a message slice with copied tool calls.
 func copyMessages(msgs []llm.Message) []llm.Message {
 	out := make([]llm.Message, len(msgs))
-	copy(out, msgs)
+	for i, m := range msgs {
+		out[i] = llm.Message{
+			Role:       m.Role,
+			Content:    m.Content,
+			ToolCallID: m.ToolCallID,
+			ToolCalls:  llm.CopyToolCalls(m.ToolCalls),
+		}
+	}
 	return out
 }
 

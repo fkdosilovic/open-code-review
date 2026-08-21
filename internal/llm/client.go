@@ -85,12 +85,39 @@ func NewTextMessage(role, content string) Message {
 
 // NewToolCallMessage creates an assistant message with text content and tool invocations.
 func NewToolCallMessage(content string, toolCalls []ToolCall) Message {
-	var tc []ToolCall
-	if len(toolCalls) > 0 {
-		tc = make([]ToolCall, len(toolCalls))
-		copy(tc, toolCalls)
+	return Message{Role: "assistant", Content: content, ToolCalls: CopyToolCalls(toolCalls)}
+}
+
+// CopyToolCalls returns a deep copy of a slice of ToolCall.
+func CopyToolCalls(calls []ToolCall) []ToolCall {
+	if calls == nil {
+		return nil
 	}
-	return Message{Role: "assistant", Content: content, ToolCalls: tc}
+	out := make([]ToolCall, len(calls))
+	for i, c := range calls {
+		out[i] = ToolCall{
+			ID:   c.ID,
+			Type: c.Type,
+			Function: FunctionCall{
+				Name:        c.Function.Name,
+				Arguments:   c.Function.Arguments,
+				ExtraFields: copyMap(c.Function.ExtraFields),
+			},
+			ExtraFields: copyMap(c.ExtraFields),
+		}
+	}
+	return out
+}
+
+func copyMap[K comparable, V any](m map[K]V) map[K]V {
+	if m == nil {
+		return nil
+	}
+	out := make(map[K]V, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // NewToolResultMessage creates a tool-role message with the given result.
@@ -139,15 +166,17 @@ type Choice struct {
 
 // ToolCall represents a function call requested by the model.
 type ToolCall struct {
-	ID       string       `json:"id"`
-	Type     string       `json:"type"`
-	Function FunctionCall `json:"function"`
+	ID          string         `json:"id"`
+	Type        string         `json:"type"`
+	Function    FunctionCall   `json:"function"`
+	ExtraFields map[string]any `json:"extra_fields,omitempty"`
 }
 
 // FunctionCall holds the name and arguments of a tool call.
 type FunctionCall struct {
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"` // JSON-encoded string
+	Name        string         `json:"name"`
+	Arguments   string         `json:"arguments"` // JSON-encoded string
+	ExtraFields map[string]any `json:"extra_fields,omitempty"`
 }
 
 // ResponseMessage extends Message with optional reasoning content.
@@ -480,6 +509,18 @@ func (c *OpenAIClient) CompletionsWithCtx(ctx context.Context, req ChatRequest) 
 		}
 		opts = append(opts, openaiopt.WithJSONSet(k, v))
 	}
+	for i, msg := range req.Messages {
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			for j, tc := range msg.ToolCalls {
+				for k, v := range tc.ExtraFields {
+					opts = append(opts, openaiopt.WithJSONSet(fmt.Sprintf("messages.%d.tool_calls.%d.%s", i, j, k), v))
+				}
+				for k, v := range tc.Function.ExtraFields {
+					opts = append(opts, openaiopt.WithJSONSet(fmt.Sprintf("messages.%d.tool_calls.%d.function.%s", i, j, k), v))
+				}
+			}
+		}
+	}
 	if stream, ok := c.cfg.ExtraBody["stream"].(bool); ok && stream {
 		return c.completionsStreaming(ctx, params, opts...)
 	}
@@ -549,6 +590,8 @@ func (c *OpenAIClient) completionsStreamingInner(ctx context.Context, params ope
 
 	accumulator := openai.ChatCompletionAccumulator{}
 	reasoningByChoice := make(map[int64]*strings.Builder)
+	toolCallExtraByChoice := make(map[int64]map[int64]map[string]any)
+	toolCallFnExtraByChoice := make(map[int64]map[int64]map[string]any)
 	seenChoices := make(map[int64]bool)
 	finishedChoices := make(map[int64]bool)
 	var choiceOrder []int64
@@ -569,21 +612,53 @@ func (c *OpenAIClient) completionsStreamingInner(ctx context.Context, params ope
 				finishedChoices[choice.Index] = true
 			}
 
-			extra, ok := choice.Delta.JSON.ExtraFields["reasoning_content"]
-			if !ok {
-				continue
+			if extra, ok := choice.Delta.JSON.ExtraFields["reasoning_content"]; ok {
+				var reasoningContent string
+				if err := json.Unmarshal([]byte(extra.Raw()), &reasoningContent); err != nil {
+					reasoningContent = extra.Raw()
+				}
+				builder := reasoningByChoice[choice.Index]
+				if builder == nil {
+					builder = &strings.Builder{}
+					reasoningByChoice[choice.Index] = builder
+				}
+				builder.WriteString(reasoningContent)
 			}
 
-			var reasoningContent string
-			if err := json.Unmarshal([]byte(extra.Raw()), &reasoningContent); err != nil {
-				reasoningContent = extra.Raw()
+			for _, tcDelta := range choice.Delta.ToolCalls {
+				tcIdx := tcDelta.Index
+				tcExtra, fnExtra := extractToolCallExtraFields(tcDelta.RawJSON())
+				if len(tcExtra) > 0 {
+					choiceExtras := toolCallExtraByChoice[choice.Index]
+					if choiceExtras == nil {
+						choiceExtras = make(map[int64]map[string]any)
+						toolCallExtraByChoice[choice.Index] = choiceExtras
+					}
+					tcExtras := choiceExtras[tcIdx]
+					if tcExtras == nil {
+						tcExtras = make(map[string]any)
+						choiceExtras[tcIdx] = tcExtras
+					}
+					for k, v := range tcExtra {
+						tcExtras[k] = v
+					}
+				}
+				if len(fnExtra) > 0 {
+					choiceFnExtras := toolCallFnExtraByChoice[choice.Index]
+					if choiceFnExtras == nil {
+						choiceFnExtras = make(map[int64]map[string]any)
+						toolCallFnExtraByChoice[choice.Index] = choiceFnExtras
+					}
+					tcFnExtras := choiceFnExtras[tcIdx]
+					if tcFnExtras == nil {
+						tcFnExtras = make(map[string]any)
+						choiceFnExtras[tcIdx] = tcFnExtras
+					}
+					for k, v := range fnExtra {
+						tcFnExtras[k] = v
+					}
+				}
 			}
-			builder := reasoningByChoice[choice.Index]
-			if builder == nil {
-				builder = &strings.Builder{}
-				reasoningByChoice[choice.Index] = builder
-			}
-			builder.WriteString(reasoningContent)
 		}
 		if !accumulator.AddChunk(chunk) {
 			return nil, &streamIntegrityError{reason: "contained inconsistent chunks"}
@@ -606,9 +681,33 @@ func (c *OpenAIClient) completionsStreamingInner(ctx context.Context, params ope
 		resp.Usage = usage
 	}
 	for i := range resp.Choices {
-		builder := reasoningByChoice[accumulator.Choices[i].Index]
-		if builder != nil {
+		chIndex := accumulator.Choices[i].Index
+		if builder := reasoningByChoice[chIndex]; builder != nil {
 			resp.Choices[i].Message.ReasoningContent = builder.String()
+		}
+		if choiceExtras := toolCallExtraByChoice[chIndex]; choiceExtras != nil {
+			for tcIdx, tcExtras := range choiceExtras {
+				if int(tcIdx) < len(resp.Choices[i].Message.ToolCalls) {
+					if resp.Choices[i].Message.ToolCalls[tcIdx].ExtraFields == nil {
+						resp.Choices[i].Message.ToolCalls[tcIdx].ExtraFields = make(map[string]any)
+					}
+					for k, v := range tcExtras {
+						resp.Choices[i].Message.ToolCalls[tcIdx].ExtraFields[k] = v
+					}
+				}
+			}
+		}
+		if choiceFnExtras := toolCallFnExtraByChoice[chIndex]; choiceFnExtras != nil {
+			for tcIdx, tcFnExtras := range choiceFnExtras {
+				if int(tcIdx) < len(resp.Choices[i].Message.ToolCalls) {
+					if resp.Choices[i].Message.ToolCalls[tcIdx].Function.ExtraFields == nil {
+						resp.Choices[i].Message.ToolCalls[tcIdx].Function.ExtraFields = make(map[string]any)
+					}
+					for k, v := range tcFnExtras {
+						resp.Choices[i].Message.ToolCalls[tcIdx].Function.ExtraFields[k] = v
+					}
+				}
+			}
 		}
 	}
 
@@ -775,13 +874,16 @@ func (c *OpenAIClient) mapOpenAIResponse(sdkResp *openai.ChatCompletion) *ChatRe
 	for _, ch := range sdkResp.Choices {
 		var toolCalls []ToolCall
 		for _, tc := range ch.Message.ToolCalls {
+			tcExtra, fnExtra := extractToolCallExtraFields(tc.RawJSON())
 			toolCalls = append(toolCalls, ToolCall{
 				ID:   tc.ID,
 				Type: tc.Type,
 				Function: FunctionCall{
-					Name:      tc.Function.Name,
-					Arguments: tc.Function.Arguments,
+					Name:        tc.Function.Name,
+					Arguments:   tc.Function.Arguments,
+					ExtraFields: fnExtra,
 				},
+				ExtraFields: tcExtra,
 			})
 		}
 
@@ -815,6 +917,41 @@ func (c *OpenAIClient) mapOpenAIResponse(sdkResp *openai.ChatCompletion) *ChatRe
 		Choices: choices,
 		Usage:   usage,
 	}
+}
+
+// extractToolCallExtraFields parses the raw JSON representation of a tool call or
+// streaming delta tool call, extracting non-standard metadata fields at both the
+// tool-call level (such as Gemini's thought_signature) and function level.
+func extractToolCallExtraFields(rawJSON string) (map[string]any, map[string]any) {
+	if rawJSON == "" {
+		return nil, nil
+	}
+	var rawMap map[string]any
+	if err := json.Unmarshal([]byte(rawJSON), &rawMap); err != nil {
+		return nil, nil
+	}
+	var tcExtra, fnExtra map[string]any
+	for k, v := range rawMap {
+		if k == "id" || k == "type" || k == "function" || k == "index" {
+			continue
+		}
+		if tcExtra == nil {
+			tcExtra = make(map[string]any)
+		}
+		tcExtra[k] = v
+	}
+	if fnRaw, ok := rawMap["function"].(map[string]any); ok {
+		for k, v := range fnRaw {
+			if k == "name" || k == "arguments" {
+				continue
+			}
+			if fnExtra == nil {
+				fnExtra = make(map[string]any)
+			}
+			fnExtra[k] = v
+		}
+	}
+	return tcExtra, fnExtra
 }
 
 // --- AnthropicClient ---

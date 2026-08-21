@@ -27,7 +27,16 @@ func TestNewTextMessage(t *testing.T) {
 
 func TestNewToolCallMessage(t *testing.T) {
 	calls := []ToolCall{
-		{ID: "c1", Type: "function", Function: FunctionCall{Name: "tool_a", Arguments: `{}`}},
+		{
+			ID:   "c1",
+			Type: "function",
+			Function: FunctionCall{
+				Name:        "tool_a",
+				Arguments:   `{}`,
+				ExtraFields: map[string]any{"fn_k": "fn_v"},
+			},
+			ExtraFields: map[string]any{"thought_signature": "sig_1"},
+		},
 		{ID: "c2", Type: "function", Function: FunctionCall{Name: "tool_b", Arguments: `{"x":1}`}},
 	}
 	m := NewToolCallMessage("thinking", calls)
@@ -43,11 +52,31 @@ func TestNewToolCallMessage(t *testing.T) {
 	if m.ToolCalls[0].ID != "c1" || m.ToolCalls[1].Function.Name != "tool_b" {
 		t.Errorf("ToolCalls not copied correctly")
 	}
+	if m.ToolCalls[0].ExtraFields["thought_signature"] != "sig_1" {
+		t.Errorf("ExtraFields not preserved: %v", m.ToolCalls[0].ExtraFields)
+	}
+	if m.ToolCalls[0].Function.ExtraFields["fn_k"] != "fn_v" {
+		t.Errorf("Function.ExtraFields not preserved: %v", m.ToolCalls[0].Function.ExtraFields)
+	}
 
 	// Mutation of original must not affect the message.
 	calls[0].ID = "mutated"
+	calls[0].ExtraFields["thought_signature"] = "mutated_sig"
+	calls[0].Function.ExtraFields["fn_k"] = "mutated_fn"
 	if m.ToolCalls[0].ID == "mutated" {
 		t.Error("NewToolCallMessage must copy ToolCalls")
+	}
+	if m.ToolCalls[0].ExtraFields["thought_signature"] == "mutated_sig" {
+		t.Error("NewToolCallMessage must deep-copy ExtraFields")
+	}
+	if m.ToolCalls[0].Function.ExtraFields["fn_k"] == "mutated_fn" {
+		t.Error("NewToolCallMessage must deep-copy Function.ExtraFields")
+	}
+}
+
+func TestCopyToolCalls_Nil(t *testing.T) {
+	if got := CopyToolCalls(nil); got != nil {
+		t.Errorf("CopyToolCalls(nil) = %v, want nil", got)
 	}
 }
 
